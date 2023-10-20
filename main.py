@@ -7,21 +7,36 @@ from pygame import Surface, SRCALPHA, draw as py_draw
 from screen import Screen
 
 
+WIDTH = 800
+HEIGHT = 400
+PARTICLE_SIZE = 5
+HEIGHT_IN_PARTICLES = HEIGHT//PARTICLE_SIZE - 1
+WIDTH_IN_PARTICLES = WIDTH//PARTICLE_SIZE - 1
+
 class Particles:
     pixel_size = 5
     colors = [
-        (40,40,40)
+        (216, 158, 121),
+        (40,40,90),
+        (10,120,3),
     ]
-    def __init__(self, max_particles) -> None:
+    SAND = 0
+    WATER = 1
+    GAS = 2
+    def __init__(self, max_particles, ptype) -> None:
         self.max_particles = max_particles
         self.active = np.zeros(shape=(max_particles), dtype=np.bool_)
         self.x = np.zeros(shape=(max_particles), dtype=np.int32)
         self.y = np.zeros(shape=(max_particles), dtype=np.int32)
+        self.ptype = ptype
+
+        self.threadsperblock = 32
+        self.blockspergrid = (max_particles + (self.threadsperblock - 1)) // self.threadsperblock
 
     def get_particle(self, i):
         if self.active[i] == False:
             return None
-        return (0, self.x[i], self.y[i])
+        return (self.ptype, self.x[i], self.y[i])
     def set_particle(self, i, x, y):
         self.active[i] = True
         self.x[i] = x
@@ -54,7 +69,7 @@ class Particles:
     # Naive solution for it
     @staticmethod
     @cuda.jit
-    def move_particles(active, x, y, size):
+    def move_particles_sand(active, x, y, size):
         i = cuda.grid(1)
         move = True
         if active[i] == True and y[i] > 0:
@@ -79,30 +94,119 @@ class Particles:
                     if move == True:
                         x[i] += 1
                         y[i] -= 1
+    
+    @staticmethod
+    @cuda.jit
+    def move_particles_gas(active, x, y, size):
+        i = cuda.grid(1)
+        move = True
+        if i < size and active[i] == True and y[i] < HEIGHT_IN_PARTICLES:
+            for other in range(0, size):
+                if active[other] == True and y[other] == y[i] + 1 and x[other] == x[i]:
+                    move = False
+            if move == True:
+                y[i] += 1
+            else:
+                move = True
+                for other in range(0, size):
+                    if active[other] == True and y[other] == y[i] + 1 and x[other] == x[i] - 1:
+                        move = False
+                if move == True:
+                    x[i] -= 1
+                    y[i] += 1
+                else:
+                    move = True
+                    for other in range(0, size):
+                        if active[other] == True and y[other] == y[i] + 1 and x[other] == x[i] + 1:
+                            move = False
+                    if move == True:
+                        x[i] += 1
+                        y[i] += 1
+                    else:
+                        left_available = True
+                        right_available = True
+                        for other in range(0, size):
+                            if active[other] == True and y[other] == y[i] and x[other] == x[i] + 1:
+                                right_available = False
+                            elif active[other] == True and y[other] == y[i] and x[other] == x[i] - 1:
+                                left_available = False
+
+                        if right_available and not left_available:
+                            x[i] += 1
+                        elif not right_available and left_available:
+                            x[i] -= 1
+
+    @staticmethod
+    @cuda.jit
+    def move_particles_water(active, x, y, size):
+        i = cuda.grid(1)
+        move = True
+        if active[i] == True and y[i] > 0:
+            for other in range(0, size):
+                if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i]:
+                    move = False
+            if move == True:
+                y[i] -= 1
+            else:
+                move = True
+                for other in range(0, size):
+                    if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i] - 1:
+                        move = False
+                if move == True:
+                    x[i] -= 1
+                    y[i] -= 1
+                else:
+                    move = True
+                    for other in range(0, size):
+                        if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i] + 1:
+                            move = False
+                    if move == True:
+                        x[i] += 1
+                        y[i] -= 1
+                    else:
+                        left_available = True
+                        right_available = True
+                        for other in range(0, size):
+                            if active[other] == True and y[other] == y[i] and x[other] == x[i] + 1:
+                                right_available = False
+                            elif active[other] == True and y[other] == y[i] and x[other] == x[i] - 1:
+                                left_available = False
+
+                        if right_available and not left_available:
+                            x[i] += 1
+                        elif not right_available and left_available:
+                            x[i] -= 1
 
     def update(self):
         d_active, d_x, d_y = self.to_device()
-        self.move_particles[1, self.max_particles](d_active, d_x, d_y, self.max_particles)
+        if self.ptype == self.SAND:
+            self.move_particles_sand[self.blockspergrid, self.threadsperblock](d_active, d_x, d_y, self.max_particles)
+        if self.ptype == self.WATER:
+            self.move_particles_water[self.blockspergrid, self.threadsperblock](d_active, d_x, d_y, self.max_particles)
+        if self.ptype == self.GAS:
+            self.move_particles_gas[self.blockspergrid, self.threadsperblock](d_active, d_x, d_y, self.max_particles)
         self.from_device(d_active, d_x, d_y)
 
 def main():
-    kp = 90
-    ws = Screen(400, 400)
-    pars = Particles(kp)
-    ws.update(pars.render(ws.width, ws.height))
+    kp = 500
+    ws = Screen(WIDTH, HEIGHT)
 
-    for x in range(kp):
-        pars.set_particle(x, 30, x*2+10)
+    pars = []
+    for part_type in range(3):
+        ps = Particles(kp, part_type)
+        for x in range(kp):
+            ps.set_particle(x, WIDTH_IN_PARTICLES//2 + x % 10, x//10 * 2)
+        pars.append(ps)
 
-    ws.update(pars.render(ws.width, ws.height))
+    ws.update([x.render(ws.width, ws.height) for x in pars])
     ws.clock.tick(60)
-    ws.update(pars.render(ws.width, ws.height))
+    ws.update([x.render(ws.width, ws.height) for x in pars])
 
     while(1):
         ws.clock.tick(60)
         
-        pars.update()
-        ws.update(pars.render(ws.width, ws.height))
+        [x.update() for x in pars]
+        ws.update([x.render(ws.width, ws.height) for x in pars])
 
 
 if __name__ == "__main__":
