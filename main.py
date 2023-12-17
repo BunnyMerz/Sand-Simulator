@@ -6,9 +6,38 @@ from pygame import Surface, SRCALPHA, draw as py_draw
 
 from screen import Screen
 
+def matrix_to_number(matrix: list[tuple[int]]):
+    return (
+        matrix[1][2] * 3**0 +
 
-WIDTH = 800
-HEIGHT = 400
+        matrix[0][2] * 3**1 +
+        matrix[0][1] * 3**2 +
+        matrix[0][0] * 3**3 +
+
+        matrix[1][0] * 3**4 +
+
+        matrix[2][0] * 3**5 +
+        matrix[2][1] * 3**6 +
+        matrix[2][2] * 3**7
+    )
+def all_possibilities(matrix: list[tuple[int]]):
+    for y in range(3):
+        for x in range(3):
+            if matrix[y][x] == 2:
+                r = []
+                matrix[y][x] = 0
+                r += all_possibilities(matrix)
+                matrix[y][x] = 1
+                r += all_possibilities(matrix)
+                matrix[y][x] = 2
+                return r
+    m = []
+    for l in matrix:
+        m.append([c for c in l])
+    return [m]
+
+WIDTH = 100
+HEIGHT = 100
 PARTICLE_SIZE = 5
 HEIGHT_IN_PARTICLES = HEIGHT//PARTICLE_SIZE - 1
 WIDTH_IN_PARTICLES = WIDTH//PARTICLE_SIZE - 1
@@ -23,26 +52,70 @@ class Particles:
     SAND = 0
     WATER = 1
     GAS = 2
-    def __init__(self, max_particles, ptype) -> None:
-        self.max_particles = max_particles
-        self.active = np.zeros(shape=(max_particles), dtype=np.bool_)
-        self.x = np.zeros(shape=(max_particles), dtype=np.int32)
-        self.y = np.zeros(shape=(max_particles), dtype=np.int32)
-        self.ptype = ptype
 
-        self.threadsperblock = 32
-        self.blockspergrid = (max_particles + (self.threadsperblock - 1)) // self.threadsperblock
+    particle_rules_const = np.zeros(shape=(3**8, 2), dtype=np.int8)
+    simple_rules = [
+        # Sand/Water/Gase
+        ([[2, 2, 2],
+         [2, 0, 2],
+         [2, 0, 2],], (0,-1)),
+         
+        ([[2, 2, 2],
+         [2, 0, 2],
+         [2, 1, 0],], (1,-1)),
+
+        ([[2, 2, 2],
+         [2, 0, 2],
+         [0, 1, 1],], (-1,-1)),
+
+         # Water/Gas
+        ([[2, 2, 2],
+         [1, 0, 0],
+         [1, 1, 1],], (1,0)),
+
+         ([[2, 2, 2],
+         [0, 0, 1],
+         [1, 1, 1],], (-1,0)),
+    ]
+    for rule, (x,y) in simple_rules:
+        for possibility in all_possibilities(rule):
+            value = matrix_to_number(possibility)
+            particle_rules_const[value][0] = x
+            particle_rules_const[value][1] = y
+
+    particle_rules_const = cuda.to_device(particle_rules_const)
+
+    def __init__(self, w, h, chunk_width) -> None:
+        self.max_particles = w*h
+
+        self.chunck_width = chunk_width
+        self.chunck_heigth = h
+        self.grid_amount = (w // self.chunck_width) + 1
+
+        self.grid = np.zeros(shape=(self.grid_amount), dtype=np.int8) # List of where each grid starts [0, 2, 10, 30] => index at x/y
+        self.active = np.zeros(shape=(self.max_particles), dtype=np.bool_)
+
+        self.d_board = cuda.to_device(np.zeros(shape=(self.grid_amount, self.chunck_heigth, self.chunck_width), dtype=np.int8))
+
+        self.ptype = np.zeros(shape=(self.max_particles), dtype=np.int8)
+        self.x = np.zeros(shape=(self.max_particles), dtype=np.int32)
+        self.y = np.zeros(shape=(self.max_particles), dtype=np.int32)
+
+
+        self.threadsperblock = 256
+        self.blockspergrid = (self.max_particles + (self.threadsperblock - 1)) // self.threadsperblock
 
     def get_particle(self, i):
         if self.active[i] == False:
             return None
-        return (self.ptype, self.x[i], self.y[i])
+        return (self.ptype[i], self.x[i], self.y[i])
     def set_particle(self, i, x, y):
         self.active[i] = True
         self.x[i] = x
         self.y[i] = y
 
     def render(self, width, height):
+        print("render start")
         output_surf = Surface((width, height), SRCALPHA)
 
         for k in range(0, self.max_particles):
@@ -57,144 +130,68 @@ class Particles:
                     )
                 )
 
+        print("render end")
         return output_surf
     
-    def from_device(self, d_active, d_x, d_y):
-        self.active = d_active.copy_to_host()
+    def from_device(self, d_grid, d_active, d_x, d_y):
+        # self.grid = d_grid.copy_to_host()
+        # self.active = d_active.copy_to_host()
         self.x = d_x.copy_to_host()
         self.y = d_y.copy_to_host()
     def to_device(self):
-        return cuda.to_device(self.active), cuda.to_device(self.x), cuda.to_device(self.y)
-
-    # Naive solution for it
-    @staticmethod
-    @cuda.jit
-    def move_particles_sand(active, x, y, size):
-        i = cuda.grid(1)
-        move = True
-        if active[i] == True and y[i] > 0:
-            for other in range(0, size):
-                if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i]:
-                    move = False
-            if move == True:
-                y[i] -= 1
-            else:
-                move = True
-                for other in range(0, size):
-                    if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i] - 1:
-                        move = False
-                if move == True:
-                    x[i] -= 1
-                    y[i] -= 1
-                else:
-                    move = True
-                    for other in range(0, size):
-                        if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i] + 1:
-                            move = False
-                    if move == True:
-                        x[i] += 1
-                        y[i] -= 1
-    
-    @staticmethod
-    @cuda.jit
-    def move_particles_gas(active, x, y, size):
-        i = cuda.grid(1)
-        move = True
-        if i < size and active[i] == True and y[i] < HEIGHT_IN_PARTICLES:
-            for other in range(0, size):
-                if active[other] == True and y[other] == y[i] + 1 and x[other] == x[i]:
-                    move = False
-            if move == True:
-                y[i] += 1
-            else:
-                move = True
-                for other in range(0, size):
-                    if active[other] == True and y[other] == y[i] + 1 and x[other] == x[i] - 1:
-                        move = False
-                if move == True:
-                    x[i] -= 1
-                    y[i] += 1
-                else:
-                    move = True
-                    for other in range(0, size):
-                        if active[other] == True and y[other] == y[i] + 1 and x[other] == x[i] + 1:
-                            move = False
-                    if move == True:
-                        x[i] += 1
-                        y[i] += 1
-                    else:
-                        left_available = True
-                        right_available = True
-                        for other in range(0, size):
-                            if active[other] == True and y[other] == y[i] and x[other] == x[i] + 1:
-                                right_available = False
-                            elif active[other] == True and y[other] == y[i] and x[other] == x[i] - 1:
-                                left_available = False
-
-                        if right_available and not left_available:
-                            x[i] += 1
-                        elif not right_available and left_available:
-                            x[i] -= 1
+        return (
+            cuda.to_device(self.grid),
+            self.d_board,
+            cuda.to_device(self.active),
+            cuda.to_device(self.ptype),
+            cuda.to_device(self.x),
+            cuda.to_device(self.y)
+        )
 
     @staticmethod
     @cuda.jit
-    def move_particles_water(active, x, y, size):
+    def update_particles(grid: list[int], board: tuple[tuple[tuple[int]]], x: list[int], y: list[int], grid_size: int, par_size: int, board_size: int):
         i = cuda.grid(1)
-        move = True
-        if active[i] == True and y[i] > 0:
-            for other in range(0, size):
-                if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i]:
-                    move = False
-            if move == True:
-                y[i] -= 1
-            else:
-                move = True
-                for other in range(0, size):
-                    if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i] - 1:
-                        move = False
-                if move == True:
-                    x[i] -= 1
-                    y[i] -= 1
-                else:
-                    move = True
-                    for other in range(0, size):
-                        if active[other] == True and y[other] == y[i] - 1 and x[other] == x[i] + 1:
-                            move = False
-                    if move == True:
-                        x[i] += 1
-                        y[i] -= 1
-                    else:
-                        left_available = True
-                        right_available = True
-                        for other in range(0, size):
-                            if active[other] == True and y[other] == y[i] and x[other] == x[i] + 1:
-                                right_available = False
-                            elif active[other] == True and y[other] == y[i] and x[other] == x[i] - 1:
-                                left_available = False
+        if i < board_size:
+            board_i = board[i]
+            start_i = grid[i]
+            end_i = 0
+            # Particles range: [start_i, end_i[
+            if start_i != None: # There are particles in this grid
+                look_x = i + 1
+                while(look_x < grid_size and grid[look_x] == None):
+                    look_x += 1
+                end_i = par_size
+                if look_x < grid_size:
+                    end_i = grid[look_x]
 
-                        if right_available and not left_available:
-                            x[i] += 1
-                        elif not right_available and left_available:
-                            x[i] -= 1
+                par_i = start_i
+                while(par_i < end_i):
+                    # Bool analysis
+                    x[par_i] += 1
+                    par_i += 1
+
 
     def update(self):
-        d_active, d_x, d_y = self.to_device()
-        if self.ptype == self.SAND:
-            self.move_particles_sand[self.blockspergrid, self.threadsperblock](d_active, d_x, d_y, self.max_particles)
-        if self.ptype == self.WATER:
-            self.move_particles_water[self.blockspergrid, self.threadsperblock](d_active, d_x, d_y, self.max_particles)
-        if self.ptype == self.GAS:
-            self.move_particles_gas[self.blockspergrid, self.threadsperblock](d_active, d_x, d_y, self.max_particles)
-        self.from_device(d_active, d_x, d_y)
+        print("======")
+        print("to device")
+        d_grid, d_board, d_active, d_ptype, d_x, d_y = self.to_device()
+        cuda.synchronize()
+        print("update")
+        self.update_particles[self.blockspergrid, self.threadsperblock](d_grid, d_board, d_x, d_y, self.grid_amount, self.max_particles, self.grid_amount)
+        print("updated")
+        cuda.synchronize()
+        self.from_device(d_grid, d_active, d_x, d_y)
+        print("from device")
+        print("==")
 
 def main():
-    kp = 500
     ws = Screen(WIDTH, HEIGHT)
 
     pars = []
-    for part_type in range(3):
-        ps = Particles(kp, part_type)
-        for x in range(kp):
+    for part_type in range(1):
+        ps = Particles(WIDTH, HEIGHT, 10)
+        for x in range(WIDTH * HEIGHT):
             ps.set_particle(x, WIDTH_IN_PARTICLES//2 + x % 10, x//10 * 2)
         pars.append(ps)
 
@@ -204,9 +201,10 @@ def main():
 
     while(1):
         ws.clock.tick(60)
-        
+        print("cycle")
         [x.update() for x in pars]
         ws.update([x.render(ws.width, ws.height) for x in pars])
+        print("rendered")
 
 
 if __name__ == "__main__":

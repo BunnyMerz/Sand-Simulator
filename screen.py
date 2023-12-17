@@ -28,7 +28,7 @@ class Screen():
     
     def update(self, to_draw: list[Surface] = None, x=0,y=0):
         self.window.fill((30,30,30))
-        delta = self.clock.tick(120) / 1000
+        # delta = self.clock.tick(120) / 1000
         events = pygame.event.get()
         for e in events:
             if pygame.QUIT == e.type: ## Avoid freezing
